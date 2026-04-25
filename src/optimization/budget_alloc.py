@@ -2,27 +2,29 @@
 Module 2 — Store-Level Budget Allocation
 =========================================
 Given a fixed replenishment budget B and probabilistic demand forecasts,
-allocate inventory spend across stores to maximise expected revenue (or
-equivalently, minimise expected stockout losses subject to a budget constraint).
+allocate inventory spend across stores to maximise expected revenue:
 
-Formulation
------------
-    max  Σ_s  revenue(q_s)
-    s.t. Σ_s  cost(q_s) ≤ B
-         q_s ≥ 0  ∀s
+    max  Σ_s  sell_price × E[min(Q_s, D_s)]
+    s.t. Σ_s  unit_cost × Q_s  ≤  B
 
-where  revenue(q_s) = sell_price × E[min(q_s, D_s)]
-and    cost(q_s)    = unit_cost × q_s
+This is separable and concave → greedy marginal revenue per dollar is optimal.
 
-This is separable → solved greedily via marginal-revenue-per-dollar ranking.
+Expected revenue model
+----------------------
+E[min(Q, D)] is approximated by integrating over the piecewise-linear CDF
+implied by (q10, q50, q90):
 
-Dollar impact: baseline = allocate B proportional to q50 across stores.
-               optimal  = greedy MR/$ allocation.
+  Q ≤ q10  →  E[min] ≈ Q                          (sell everything, ~certain)
+  q10<Q≤q50 →  E[min] ≈ q10 + (Q-q10)*(1-0.10/0.50)  (prob of selling tapers)
+  q50<Q≤q90 →  E[min] ≈ q50 + (Q-q50)*(1-0.50/0.90)  (prob tapers further)
+  Q > q90   →  E[min] ≈ q90                        (hard cap: demand exhausted)
+
+This gives a monotone concave function, which is the correct shape for the
+greedy marginal-revenue algorithm to work properly.
 """
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import linprog
 from typing import Optional
 from dataclasses import dataclass
 
@@ -31,26 +33,22 @@ from src.data.features import AVG_UNIT_COST, AVG_SELL_PRICE
 
 @dataclass
 class BudgetParams:
-    budget_usd: float = 500_000.0      # replenishment budget per cycle ($)
-    unit_cost: float = AVG_UNIT_COST   # $ COGS per unit
-    sell_price: float = AVG_SELL_PRICE # $ retail price per unit
+    budget_usd: float  = 500_000.0
+    unit_cost:  float  = AVG_UNIT_COST
+    sell_price: float  = AVG_SELL_PRICE
 
 
-# ── Store-level forecast aggregation ──────────────────────────────────────────
+# ── Store-level aggregation ───────────────────────────────────────────────────
 
 def aggregate_by_store(forecast_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Collapse item-level forecasts to store-level totals.
-    forecast_df must have columns: store_id, q10, q50, q90.
-    """
-    agg = (forecast_df
-           .groupby("store_id")[["q10", "q50", "q90"]]
-           .sum()
-           .reset_index())
-    return agg
+    """Sum item-level forecasts to store-level totals."""
+    return (forecast_df
+            .groupby("store_id")[["q10", "q50", "q90"]]
+            .sum()
+            .reset_index())
 
 
-# ── Revenue function (expected sales = E[min(Q, D)]) ─────────────────────────
+# ── Expected revenue (correct piecewise-linear CDF) ──────────────────────────
 
 def expected_revenue(order_qty: np.ndarray,
                       q10: np.ndarray,
@@ -58,88 +56,106 @@ def expected_revenue(order_qty: np.ndarray,
                       q90: np.ndarray,
                       sell_price: float = AVG_SELL_PRICE) -> np.ndarray:
     """
-    Approximate E[min(Q, D)] using linear interpolation on the forecast CDF.
-    Revenue = sell_price × E[min(Q, D)].
-    """
-    order_qty = np.asarray(order_qty, dtype=float)
-    q10, q50, q90 = map(np.asarray, (q10, q50, q90))
+    E[min(Q, D)] via piecewise-linear CDF interpolation.
 
-    # E[min(Q,D)] ≈ Q  when Q ≤ q10 (almost certain to sell all)
-    #             ≈ q50  when Q ≥ q90 (demand capped)
-    # Linearly interpolate between quantile points
+    Slopes are derived from quantile probabilities:
+      - Below q10  : slope = 1.0  (selling every unit with near-certainty)
+      - q10 → q50  : slope = (0.50 - 0.10) / (q50 - q10) per unit of Q,
+                     integrated gives (1 - 0.10) at q10 tapering to (1 - 0.50) at q50
+      - q50 → q90  : same logic, tapering to (1 - 0.90)
+      - Above q90  : slope = 0    (additional stock almost never sells)
+    """
+    Q   = np.asarray(order_qty, dtype=float)
+    q10 = np.asarray(q10, dtype=float)
+    q50 = np.asarray(q50, dtype=float)
+    q90 = np.asarray(q90, dtype=float)
+
+    # Avoid division by zero for degenerate quantiles
+    span_low  = np.maximum(q50 - q10, 1e-6)
+    span_high = np.maximum(q90 - q50, 1e-6)
+
+    # Slope of E[min] in each region (marginal sell-through probability)
+    slope_low  = (0.50 - 0.10) / span_low   * span_low   # = 0.40 per unit of span
+    slope_high = (0.90 - 0.50) / span_high  * span_high  # = 0.40 per unit of span
+
+    # Actually we want the *average* probability of selling a marginal unit:
+    #   in [q10, q50]: prob ranges from 0.90 down to 0.50  → avg = 0.70
+    #   in [q50, q90]: prob ranges from 0.50 down to 0.10  → avg = 0.30
+    # So E[min] increments are:
+    #   each unit in [q10,q50] contributes ~0.70 expected sales
+    #   each unit in [q50,q90] contributes ~0.30 expected sales
+
     e_sales = np.where(
-        order_qty <= q10, order_qty,
+        Q <= q10,
+        Q,                                                      # region 1: sell all
         np.where(
-            order_qty <= q50,
-            q10 + (order_qty - q10) * 0.8,
+            Q <= q50,
+            q10 + (Q - q10) * 0.70,                            # region 2
             np.where(
-                order_qty <= q90,
-                q50 + (order_qty - q50) * 0.5,
-                q90 * 0.95  # diminishing returns beyond q90
+                Q <= q90,
+                q10 + span_low * 0.70 + (Q - q50) * 0.30,     # region 3
+                q10 + span_low * 0.70 + span_high * 0.30       # region 4: capped
             )
         )
     )
     return sell_price * e_sales
 
 
-# ── Greedy marginal allocation ────────────────────────────────────────────────
+# ── Greedy allocation ─────────────────────────────────────────────────────────
 
 def greedy_budget_allocation(store_df: pd.DataFrame,
                               params: Optional[BudgetParams] = None,
-                              n_steps: int = 1000) -> pd.DataFrame:
+                              n_steps: int = 10_000) -> pd.DataFrame:
     """
-    Greedy algorithm: repeatedly assign one unit to the store with the
-    highest marginal revenue per dollar until budget is exhausted.
+    Greedy marginal-revenue-per-dollar allocation.
 
-    Parameters
-    ----------
-    store_df : DataFrame with columns [store_id, q10, q50, q90]
-    params   : BudgetParams
-    n_steps  : resolution of the greedy search
+    At each step assigns a unit bundle to the store with the highest
+    incremental revenue per dollar spent. Runs until budget exhausted.
 
-    Returns
-    -------
-    DataFrame with columns [store_id, q50_naive, q_optimal, revenue_naive,
-                             revenue_optimal, cost_naive, cost_optimal]
+    n_steps controls resolution: higher = more accurate but slower.
+    Default 10,000 gives good accuracy on store-level M5 aggregates.
     """
     if params is None:
         params = BudgetParams()
 
     stores = store_df["store_id"].values
-    q10    = store_df["q10"].values
-    q50    = store_df["q50"].values
-    q90    = store_df["q90"].values
+    q10    = store_df["q10"].values.astype(float)
+    q50    = store_df["q50"].values.astype(float)
+    q90    = store_df["q90"].values.astype(float)
     n      = len(stores)
 
-    unit_budget = params.unit_cost  # cost per unit
+    # Step size: spread budget across n_steps increments
+    total_units = params.budget_usd / params.unit_cost
+    step_qty    = max(1.0, total_units / n_steps)
 
-    # Baseline: proportional allocation (order proportional to q50)
+    # Naive baseline: allocate proportional to q50
     total_q50   = q50.sum()
-    naive_alloc = (q50 / total_q50) * (params.budget_usd / params.unit_cost)
+    naive_alloc = (q50 / total_q50) * total_units
 
     # Greedy allocation
-    alloc    = np.zeros(n)
-    budget   = params.budget_usd
-    step_qty = max(1.0, total_q50 / n_steps)  # qty per step
+    alloc  = np.zeros(n)
+    budget = params.budget_usd
 
-    while budget >= unit_budget * step_qty:
-        # Compute marginal revenue for each store at current allocation
-        current_rev = expected_revenue(alloc,       q10, q50, q90, params.sell_price)
-        next_rev    = expected_revenue(alloc + step_qty, q10, q50, q90, params.sell_price)
-        marginal_mr = (next_rev - current_rev) / (unit_budget * step_qty + 1e-9)
+    while budget >= params.unit_cost * step_qty:
+        cur_rev  = expected_revenue(alloc,              q10, q50, q90, params.sell_price)
+        next_rev = expected_revenue(alloc + step_qty,   q10, q50, q90, params.sell_price)
+        mr_per_dollar = (next_rev - cur_rev) / (params.unit_cost * step_qty + 1e-9)
 
-        # Allocate to store with highest MR/$
-        best = np.argmax(marginal_mr)
+        best = np.argmax(mr_per_dollar)
+
+        # Stop if no store benefits from more inventory (all past q90)
+        if mr_per_dollar[best] <= 0:
+            break
+
         alloc[best] += step_qty
-        budget       -= unit_budget * step_qty
+        budget       -= params.unit_cost * step_qty
 
-    # Build results
     rev_naive   = expected_revenue(naive_alloc, q10, q50, q90, params.sell_price)
     rev_optimal = expected_revenue(alloc,       q10, q50, q90, params.sell_price)
 
-    result = pd.DataFrame({
-        "store_id"        : stores,
-        "demand_q50"      : q50,
+    return pd.DataFrame({
+        "store_id"            : stores,
+        "demand_q50"          : q50,
         "alloc_naive_units"   : naive_alloc,
         "alloc_optimal_units" : alloc,
         "revenue_naive_usd"   : rev_naive,
@@ -147,17 +163,12 @@ def greedy_budget_allocation(store_df: pd.DataFrame,
         "cost_naive_usd"      : naive_alloc * params.unit_cost,
         "cost_optimal_usd"    : alloc       * params.unit_cost,
     })
-    return result
 
 
 # ── Dollar impact summary ─────────────────────────────────────────────────────
 
 def budget_dollar_impact(forecast_df: pd.DataFrame,
                           params: Optional[BudgetParams] = None) -> dict:
-    """
-    Full pipeline: aggregate → allocate → compute dollar impact.
-    Returns summary dict suitable for MLflow logging / dashboard display.
-    """
     if params is None:
         params = BudgetParams()
 
@@ -169,25 +180,23 @@ def budget_dollar_impact(forecast_df: pd.DataFrame,
     rev_uplift        = total_rev_optimal - total_rev_naive
     uplift_pct        = rev_uplift / (total_rev_naive + 1e-8) * 100
 
-    # Store with biggest reallocation
-    result["realloc_delta"] = (result["alloc_optimal_units"]
-                               - result["alloc_naive_units"])
+    result["realloc_delta"] = result["alloc_optimal_units"] - result["alloc_naive_units"]
     top_gainer = result.loc[result["realloc_delta"].idxmax(), "store_id"]
     top_loser  = result.loc[result["realloc_delta"].idxmin(), "store_id"]
 
-    annualised_uplift  = rev_uplift * (365 / 28)
-    enterprise_uplift  = annualised_uplift * 470   # scale to 4700 stores
+    annualised_uplift = rev_uplift * (365 / 28)
+    enterprise_uplift = annualised_uplift * 470
 
     return {
-        "policy"                        : "Greedy Marginal Revenue Allocation",
-        "budget_usd"                    : params.budget_usd,
-        "total_revenue_naive_usd"       : round(total_rev_naive,   2),
-        "total_revenue_optimal_usd"     : round(total_rev_optimal, 2),
-        "revenue_uplift_28d_usd"        : round(rev_uplift,        2),
-        "revenue_uplift_pct"            : round(uplift_pct,        2),
-        "annualised_uplift_10stores_usd": round(annualised_uplift,  0),
-        "enterprise_uplift_usd"         : round(enterprise_uplift,  0),
-        "top_gaining_store"             : top_gainer,
-        "top_losing_store"              : top_loser,
-        "store_allocation_df"           : result,
+        "policy"                         : "Greedy Marginal Revenue Allocation",
+        "budget_usd"                     : params.budget_usd,
+        "total_revenue_naive_usd"        : round(total_rev_naive,   2),
+        "total_revenue_optimal_usd"      : round(total_rev_optimal, 2),
+        "revenue_uplift_28d_usd"         : round(rev_uplift,        2),
+        "revenue_uplift_pct"             : round(uplift_pct,        2),
+        "annualised_uplift_10stores_usd" : round(annualised_uplift,  0),
+        "enterprise_uplift_usd"          : round(enterprise_uplift,  0),
+        "top_gaining_store"              : top_gainer,
+        "top_losing_store"               : top_loser,
+        "store_allocation_df"            : result,
     }

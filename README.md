@@ -1,9 +1,9 @@
 # M5 Demand Forecasting + Inventory Optimization
 
-> **End-to-end ML pipeline**: probabilistic demand forecasting on 59M+ Walmart sales records → three optimization modules → **$2.1B+ estimated enterprise annual impact**
+> **End-to-end ML pipeline**: probabilistic demand forecasting on 57M+ Walmart sales records → three inventory optimization modules → **$346.7M estimated enterprise annual impact** (markdown module; newsvendor & budget allocation modules have known approximation bugs — see Results)
 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://python.org)
-[![LightGBM](https://img.shields.io/badge/LightGBM-4.3-brightgreen.svg)](https://lightgbm.readthedocs.io)
+[![XGBoost](https://img.shields.io/badge/XGBoost-GPU-brightgreen.svg)](https://xgboost.readthedocs.io)
 [![MLflow](https://img.shields.io/badge/MLflow-tracked-orange.svg)](https://mlflow.org)
 [![Tests](https://img.shields.io/badge/tests-32%20passing-brightgreen.svg)]()
 
@@ -41,8 +41,8 @@ This project quantifies how **probabilistic forecasting** (quantile regression) 
                 └───────────┬────────────┘
                             │
          ┌──────────────────▼──────────────────────┐
-         │        LightGBM Quantile Regression      │
-         │   Walk-forward CV  ·  MLflow tracking    │
+         │        XGBoost Quantile Regression       │
+         │  GPU (P100) · Walk-forward CV · MLflow   │
          │                                          │
          │   q10 ──── q50 (median) ──── q90         │
          │    ↓            ↓              ↓          │
@@ -75,35 +75,55 @@ This project quantifies how **probabilistic forecasting** (quantile regression) 
 
 ### Forecasting Performance
 
-| Metric | Value | Baseline (naïve lag-28) |
+| Model | CV WRMSSE (mean ± std) | CV Dollar Cost (mean) |
 |---|---|---|
-| WRMSSE (q50) | ~0.65–0.75 | 1.0 (by definition) |
-| CV folds | 3 walk-forward | — |
-| Forecast horizon | 28 days | — |
-| Models trained | 3 (q10, q50, q90) | — |
+| q10 | 0.7929 ± 0.0126 | $4,372,260 |
+| q50 | 0.5720 ± 0.0116 | $2,441,506 |
+| q90 | 0.8724 ± 0.0060 | $513,511 |
 
-> **Walk-forward validation** ensures no data leakage: each fold trains on all data before the validation window, mimicking real production deployment.
+| Setting | Value |
+|---|---|
+| CV folds | 3 walk-forward |
+| Forecast horizon | 28 days |
+| Train rows (fold 0 → 2) | 54.9M → 55.8M → 56.6M |
+| Val rows per fold | 853,720 |
+| GPU training time (all 3 models) | ~2.5 hours (P100) |
+| Quantile objective | `reg:quantileerror` (XGBoost) |
 
-### Optimization Dollar Impact (10 M5 Stores, Annualised)
+> **Walk-forward validation** ensures no data leakage: each fold trains on all data before the validation window, mimicking real production deployment. The q50 model is explained via SHAP TreeExplainer on a 3,000-row sample.
 
-| Module | Policy | Metric | Annual Impact |
+### Optimization Dollar Impact
+
+Actual output from `04_optimization.ipynb` (10 M5 stores, extrapolated to 4,700):
+
+| Module | 28-day impact | Enterprise annual (×470 stores) | Status |
 |---|---|---|---|
-| **Newsvendor** | Critical Ratio ordering | Inventory cost reduction | ~$4.5M |
-| **Budget Allocation** | Greedy Marginal Revenue | Revenue uplift | ~$2.1M |
-| **Markdown Scheduling** | Price-elasticity clearance | Revenue recovery | ~$1.8M |
-| **Combined** | All three modules | Total annual benefit | **~$8.4M** |
-
-### Enterprise Scale (extrapolated to 4,700 Walmart US stores)
+| **Newsvendor** | −$9K | −$52.9M | ⚠️ Bug — see below |
+| **Budget Allocation** | −$7K | −$45.2M | ⚠️ Bug — see below |
+| **Markdown Scheduling** | +$73K | +$444.8M | ✅ Working |
+| **Combined** | — | **+$346.7M** | — |
 
 ```
-Newsvendor savings      ≈  $2.1B / year
-Budget allocation lift  ≈  $0.98B / year
-Markdown revenue gain   ≈  $0.84B / year
-─────────────────────────────────────────
-Total enterprise impact ≈  $3.9B / year
+========================================================
+ENTERPRISE ANNUAL IMPACT  (4,700 US stores)
+========================================================
+  Module 1 — Newsvendor (inventory cost) : $-52.9M
+  Module 2 — Budget allocation (revenue) : $-45.2M
+  Module 3 — Markdown scheduling (revenue): $444.8M
+--------------------------------------------------------
+  TOTAL                                  : $346.7M
+========================================================
 ```
 
-> *Extrapolation assumes uniform store characteristics. Real deployment would require store-type segmentation and elasticity estimation per market.*
+**Known issues in optimization modules:**
+
+- **Newsvendor**: `fmt()` formatting function misclassifies float values as integers for some output fields (critical_ratio, avg_order_qty display as `$1` and `$5`). More critically, the `saving_28d_usd` is negative (−$8,639), meaning the optimal policy costs *more* than the naive q50 baseline. This likely reflects a bug in the `expected_cost()` approximation — the linear overstock/understock approximation breaks down at CR = 0.9989, where Q* is far above q90, producing large holding costs that swamp the stockout savings.
+- **Budget Allocation**: Greedy MR/$ allocation underperforms proportional baseline (−$7K over 28 days). The `expected_revenue()` approximation caps revenue at `q90 × 0.95` regardless of allocation, which removes the marginal incentive to shift units to high-demand stores.
+
+Cost parameters confirmed from output:
+- `c_o = $0.0048/unit/day`, `c_u = $4.20/unit`, **CR = 0.9989** → 99.9th percentile service level target
+
+> *Extrapolation assumes uniform store characteristics. The markdown module result ($444.8M) is directionally valid; the newsvendor and budget allocation figures require fixing the approximation bugs before use.*
 
 ---
 
@@ -125,11 +145,11 @@ F(Q*) = CR = c_u / (c_u + c_o)
 ```
 
 With Walmart-scale assumptions:
-- `c_o = $0.048/unit/day`  (25% holding cost rate on $7 avg COGS)
-- `c_u = $4.20/unit`       (40% lost margin + goodwill on $10.50 avg price)
-- **CR ≈ 0.988** → order at the ~99th percentile of demand
+- `c_o = $0.0048/unit/day`  (25% holding cost rate on $7 avg COGS)
+- `c_u = $4.20/unit`        (40% lost margin + goodwill on $10.50 avg price)
+- **CR = 0.9989** → 99.9th percentile service level target
 
-Since stockout costs dwarf holding costs, the model recommends stocking above the median — exactly what the q90 quantile forecast enables.
+Since stockout costs dwarf holding costs, the model recommends stocking well above the median. However, the current `expected_cost()` implementation uses a linear approximation that breaks down at CR values this extreme — Q* is pushed far beyond q90, producing holding costs that exceed the stockout savings. This is a known bug to fix before production use.
 
 ### Module 2: Store Budget Allocation
 
@@ -182,12 +202,14 @@ From `notebooks/eda.py`:
 m5-forecast-optimize/
 ├── data/                          # M5 CSVs (not committed — see setup)
 ├── notebooks/
-│   └── eda.py                     # EDA script (run as Jupyter or plain Python)
+│   ├── 02_feature_engineering.ipynb  # Feature pipeline, per-store parquets
+│   ├── 03_forecasting.ipynb          # XGBoost training, SHAP, forecast export
+│   └── 04_optimization.ipynb         # Newsvendor, budget alloc, markdown
 ├── src/
 │   ├── data/
 │   │   └── features.py            # Full feature engineering pipeline
 │   ├── forecasting/
-│   │   └── lgbm_quantile.py       # LightGBM q10/q50/q90 + SHAP + MLflow
+│   │   └── xgb_quantile.py        # XGBoost q10/q50/q90 + SHAP + MLflow
 │   ├── optimization/
 │   │   ├── newsvendor.py          # Module 1: critical ratio inventory
 │   │   ├── budget_alloc.py        # Module 2: greedy MR/$ allocation
@@ -196,6 +218,7 @@ m5-forecast-optimize/
 │       └── app.py                 # Streamlit interactive dashboard
 ├── tests/
 │   └── test_optimization.py       # 32 unit + integration tests
+├── config.py                      # Single source of truth for paths & params
 ├── run_pipeline.py                # End-to-end pipeline entry point
 └── requirements.txt
 ```
@@ -220,6 +243,15 @@ unzip m5-forecasting-accuracy.zip -d data/
 
 ### 3. Run the pipeline
 
+**Notebook workflow (recommended):**
+```bash
+# Run notebooks in order
+jupyter notebook notebooks/02_feature_engineering.ipynb
+jupyter notebook notebooks/03_forecasting.ipynb      # GPU recommended; ~2.5h on P100
+jupyter notebook notebooks/04_optimization.ipynb
+```
+
+**Or run end-to-end from CLI:**
 ```bash
 # Development run (500 items, fast iteration)
 python run_pipeline.py --n_items 500 --output_dir outputs/
@@ -238,13 +270,7 @@ streamlit run src/dashboard/app.py
 mlflow ui --backend-store-uri mlruns/
 ```
 
-### 5. Run EDA
-
-```bash
-python notebooks/eda.py   # saves figures to outputs/eda/
-```
-
-### 6. Run tests
+### 5. Run tests
 
 ```bash
 pytest tests/ -v
@@ -254,12 +280,12 @@ pytest tests/ -v
 
 ## Design Decisions
 
-**Why LightGBM over LSTM?**
-The M5 winning solutions were predominantly gradient boosted trees. LightGBM handles:
-- Tabular features (price, calendar, SNAP) natively
-- Missing values without imputation
-- GPU acceleration on large datasets
-- Interpretability via SHAP
+**Why XGBoost over LightGBM?**
+Both are strong gradient boosting frameworks for tabular data. XGBoost was chosen here because:
+- `reg:quantileerror` is a first-class objective with native GPU support via `device="cuda"`
+- The P100 Kaggle GPU yields 3–5× speedup over CPU on 57M rows
+- `tree_method="hist"` keeps memory footprint low, enabling streaming from per-store parquets
+- SHAP TreeExplainer integrates directly with `xgb.Booster` objects
 
 **Why quantile regression over point forecasting?**
 The three optimization modules all require demand uncertainty estimates:
@@ -279,7 +305,7 @@ Standard k-fold cross-validation violates the temporal ordering assumption, caus
 | Skill | Where |
 |---|---|
 | Feature engineering at scale | `src/data/features.py` — lag/rolling/price/calendar features on 59M rows |
-| Quantile regression | `lgbm_quantile.py` — three quantile models with walk-forward CV |
+| Quantile regression | `xgb_quantile.py` — three quantile models with walk-forward CV |
 | Operations research | `newsvendor.py` — critical ratio derivation and interpolation |
 | Constrained optimisation | `budget_alloc.py` — greedy MR/$ with budget constraint |
 | Pricing models | `markdown.py` — price-elasticity demand model |
