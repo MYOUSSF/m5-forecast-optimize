@@ -1,0 +1,26 @@
+# Data and Database Files
+*.db
+*.csv
+*.parquet
+*.json
+
+# Machine Learning and MLflow
+mlruns/
+outputs/
+
+# Images
+*.png
+*.jpg
+*.jpeg
+
+# Python and Environments
+.ipynb
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+
+# macOS
+.DS_Store
