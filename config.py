@@ -81,8 +81,7 @@ HORIZON     = int(os.environ.get("HORIZON", 28))
 
 # ── model parameters ────────────────────────────────────────────────────────────
 
-# QUANTILES = [0.10, 0.50, 0.90]
-QUANTILES = [0.50]
+QUANTILES = [0.10, 0.50, 0.90]
 
 BASE_PARAMS = dict(
     n_estimators      = 2000,
