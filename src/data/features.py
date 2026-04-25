@@ -157,58 +157,55 @@ def build_features(data_dir: str | Path,
                    cache_dir: Optional[str | Path] = None) -> pd.DataFrame:
     """
     Build features for all stores, processing one store at a time.
+    Writes each store to a parquet file in cache_dir and returns immediately —
+    never concatenates all stores into RAM.
+
+    Downstream training and inference read directly from the per-store
+    parquets via _load_slice() and the store cache, keeping peak RAM
+    to one store at a time (~400 MB each).
 
     Parameters
     ----------
     data_dir  : folder with M5 CSVs
     n_items   : subsample N items total (None = all 30,490)
-    cache_dir : if given, save per-store parquets here and reload
-                (allows resuming if kernel crashes mid-way)
+    cache_dir : folder to write per-store parquets
+
+    Returns
+    -------
+    cache_dir : Path to the folder of per-store parquet files
     """
     sales, calendar, prices = load_raw(data_dir)
 
     if n_items:
         sales = sales.sample(n=n_items, random_state=42)
 
-    stores = sales["store_id"].unique()
-    logger.info("Processing %d stores, %d series each", len(stores),
-                len(sales) // len(stores))
-
-    if cache_dir:
-        cache_dir = Path(cache_dir)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # Always write each store to disk — never accumulate in RAM
-    cache_dir = Path(cache_dir) if cache_dir else Path("/kaggle/working/store_cache")
+    stores    = sales["store_id"].unique()
+    from config import CACHE_DIR as _DEFAULT_CACHE
+    cache_dir = Path(cache_dir) if cache_dir else Path(_DEFAULT_CACHE)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    logger.info("Processing %d stores | cache -> %s", len(stores), cache_dir)
+
     for i, store in enumerate(stores):
-        store_sales = sales[sales["store_id"] == store]
-        cache_file  = cache_dir / f"features_{store}.parquet"
+        cache_file = cache_dir / f"features_{store}.parquet"
 
         if cache_file.exists():
-            logger.info("[%d/%d] %s — already cached, skipping", i+1, len(stores), store)
+            logger.info("[%d/%d] %s — cached, skipping", i+1, len(stores), store)
             continue
 
+        store_sales = sales[sales["store_id"] == store]
         logger.info("[%d/%d] %s — building features (%d series)",
                     i+1, len(stores), store, len(store_sales))
 
         store_df = _build_store_features(store_sales, calendar, prices, lags, windows)
         store_df.to_parquet(cache_file, index=False)
-        logger.info("  -> saved %.0f MB to %s", _mem_mb(store_df), cache_file.name)
+        logger.info("  -> %.0f MB saved to %s", _mem_mb(store_df), cache_file.name)
         del store_df
         gc.collect()
 
-    # Read and concat store parquets one at a time
-    logger.info("Concatenating store parquets...")
-    parts = [pd.read_parquet(cache_dir / f"features_{s}.parquet") for s in stores]
-    df = pd.concat(parts, ignore_index=True)
-    del parts
-    gc.collect()
-
-    logger.info("Feature matrix: %s rows x %s cols | %.0f MB",
-                len(df), df.shape[1], _mem_mb(df))
-    return df
+    files = sorted(cache_dir.glob("features_*.parquet"))
+    logger.info("Done. %d store parquets in %s", len(files), cache_dir)
+    return cache_dir
 
 
 # ── Convenience: melt_sales for EDA notebook ─────────────────────────────────

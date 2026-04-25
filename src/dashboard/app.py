@@ -183,7 +183,7 @@ def tab_forecast(data):
         xaxis_title="Date", yaxis_title="Units",
         legend=dict(orientation="h", y=1.05),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # Forecast distribution
     col1, col2 = st.columns(2)
@@ -192,7 +192,7 @@ def tab_forecast(data):
                              title="Distribution of Median Forecasts",
                              color_discrete_sequence=[C_BLUE],
                              template=PLOTLY_TEMPLATE)
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width='stretch')
 
     with col2:
         fc["pi_width"] = fc["q90"] - fc["q10"]
@@ -200,7 +200,7 @@ def tab_forecast(data):
                              title="Forecast Uncertainty (PI Width)",
                              color_discrete_sequence=[C_ORANGE],
                              template=PLOTLY_TEMPLATE)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
 
 
 # ── Newsvendor tab ────────────────────────────────────────────────────────────
@@ -239,7 +239,7 @@ def tab_newsvendor(data):
         fig.update_layout(template=PLOTLY_TEMPLATE, height=320,
                            title="Total Inventory Cost: Naive vs Optimal",
                            yaxis_title="Cost ($)", showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with col2:
         if "forecasts" in data:
@@ -259,7 +259,7 @@ def tab_newsvendor(data):
             fig2.add_shape(type="line", x0=0, y0=0,
                            x1=fc["q50"].max(), y1=fc["q50"].max(),
                            line=dict(color=C_GRAY, dash="dash"))
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width='stretch')
 
     st.info(
         f"**Interpretation:** The newsvendor model uses the critical ratio "
@@ -307,7 +307,7 @@ def tab_budget(data):
             fig.update_layout(barmode="group", template=PLOTLY_TEMPLATE,
                                height=320, title="Units Allocated per Store",
                                xaxis_title="Store", yaxis_title="Units")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         with col2:
             fig2 = go.Figure()
@@ -322,7 +322,7 @@ def tab_budget(data):
             fig2.update_layout(barmode="group", template=PLOTLY_TEMPLATE,
                                 height=320, title="Expected Revenue per Store",
                                 xaxis_title="Store", yaxis_title="Revenue ($)")
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width='stretch')
 
         sa["realloc_delta"] = sa["alloc_optimal_units"] - sa["alloc_naive_units"]
         fig3 = px.bar(sa, x="store_id", y="realloc_delta",
@@ -331,7 +331,7 @@ def tab_budget(data):
                        title="Reallocation Delta (Optimal − Naive) per Store",
                        template=PLOTLY_TEMPLATE, height=280)
         fig3.update_layout(coloraxis_showscale=False)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
 
     st.info(
         f"**Interpretation:** Greedy marginal-revenue-per-dollar allocation "
@@ -381,7 +381,7 @@ def tab_markdown(data):
                                   "count": "# Items"},
                           template=PLOTLY_TEMPLATE, height=320)
             fig.update_layout(coloraxis_showscale=False)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         with col2:
             sample = mk[mk["markdown_applied"]].sample(min(2000, len(mk[mk["markdown_applied"]])))
@@ -395,13 +395,13 @@ def tab_markdown(data):
                                        "markdown_depth_pct": "Depth %"},
                                template=PLOTLY_TEMPLATE, height=320,
                                opacity=0.7)
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width='stretch')
 
         fig3 = px.histogram(mk[mk["markdown_applied"]], x="clearance_rate",
                              nbins=40, title="Clearance Rate Distribution",
                              color_discrete_sequence=[C_ORANGE],
                              template=PLOTLY_TEMPLATE, height=250)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
 
 
 # ── Combined impact tab ───────────────────────────────────────────────────────
@@ -444,7 +444,7 @@ def tab_combined(data):
         yaxis_title="Annual Impact ($)",
         showlegend=False,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # Waterfall
     fig2 = go.Figure(go.Waterfall(
@@ -461,7 +461,7 @@ def tab_combined(data):
     ))
     fig2.update_layout(template=PLOTLY_TEMPLATE, height=350,
                         title="Cumulative Impact Waterfall")
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width='stretch')
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

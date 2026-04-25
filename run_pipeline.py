@@ -25,7 +25,7 @@ from pathlib import Path
 from datetime import datetime
 
 from src.data.features import build_features, FEATURE_COLS
-from src.forecasting.lgbm_quantile import (
+from src.forecasting.xgb_quantile import (
     train_quantile_models, predict_quantiles, compute_shap
 )
 from src.optimization.newsvendor import inventory_dollar_impact, optimal_order_quantity, CostParams
@@ -51,21 +51,30 @@ def parse_args():
     return p.parse_args()
 
 
-def make_forecast_df(df: pd.DataFrame, models: dict, id_col="id") -> pd.DataFrame:
+def make_forecast_df(cache_dir: Path, models: dict, id_col="id") -> pd.DataFrame:
     """Run inference and attach forecasts to the last 28 days of the feature df."""
-    last_date  = df["date"].max()
-    cutoff     = last_date - pd.Timedelta(days=27)
-    test_df    = df[df["date"] >= cutoff].copy()
+    # Get last date from one store
+    sample_pq = next(cache_dir.glob("features_*.parquet"))
+    sample_df = pd.read_parquet(sample_pq, columns=["date"])
+    last_date = pd.to_datetime(sample_df["date"]).max()
+    cutoff    = last_date - pd.Timedelta(days=27)
 
-    preds = predict_quantiles(models, test_df)
-    test_df = test_df.reset_index(drop=True)
-    preds   = preds.reset_index(drop=True)
+    out_parts = []
+    for pq in cache_dir.glob("features_*.parquet"):
+        df = pd.read_parquet(pq)
+        df["date"] = pd.to_datetime(df["date"])
+        test_df = df[df["date"] >= cutoff].copy()
 
-    out = pd.concat([
-        test_df[["id", "store_id", "item_id", "date", "sales"]],
-        preds
-    ], axis=1)
-    return out
+        preds = predict_quantiles(models, test_df)
+        test_df = test_df.reset_index(drop=True)
+        preds   = preds.reset_index(drop=True)
+
+        out_parts.append(pd.concat([
+            test_df[["id", "store_id", "item_id", "date", "sales"]],
+            preds
+        ], axis=1))
+
+    return pd.concat(out_parts, ignore_index=True)
 
 
 def simulate_inventory(forecast_df: pd.DataFrame) -> pd.DataFrame:
@@ -94,20 +103,20 @@ def main():
 
     # ── 1. Feature Engineering ────────────────────────────────────────────────
     logger.info("[1/5] Building features...")
-    df = build_features(args.data_dir, n_items=n_items)
-    logger.info("Feature matrix: %s rows × %s cols", *df.shape)
+    cache_dir = build_features(args.data_dir, n_items=n_items)
+    logger.info("Feature matrix cached to %s", cache_dir)
 
-    # ── 2. Train LightGBM quantile models ────────────────────────────────────
-    logger.info("[2/5] Training LightGBM quantile models...")
+    # ── 2. Train XGBoost quantile models ────────────────────────────────────
+    logger.info("[2/5] Training XGBoost quantile models...")
     models = train_quantile_models(
-        df,
+        cache_dir,
         output_dir=output_dir / "models",
         n_cv_splits=args.n_cv,
     )
 
     # ── 3. Generate forecasts ─────────────────────────────────────────────────
     logger.info("[3/5] Generating 28-day probabilistic forecasts...")
-    forecast_df = make_forecast_df(df, models)
+    forecast_df = make_forecast_df(cache_dir, models)
     forecast_df = simulate_inventory(forecast_df)
 
     # Compute q_star for markdown module
@@ -125,7 +134,9 @@ def main():
 
     # ── 4. SHAP analysis ──────────────────────────────────────────────────────
     logger.info("[4/5] Computing SHAP feature importance...")
-    sample = df.sample(min(5000, len(df)), random_state=42)
+    sample_pq = next(cache_dir.glob("features_*.parquet"))
+    df_sample = pd.read_parquet(sample_pq)
+    sample = df_sample.sample(min(5000, len(df_sample)), random_state=42)
     compute_shap(
         models[0.50], sample,
         save_path=output_dir / "shap_beeswarm.png"
