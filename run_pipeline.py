@@ -29,7 +29,7 @@ from src.forecasting.xgb_quantile import (
     train_quantile_models, predict_quantiles, compute_shap
 )
 from src.optimization.newsvendor import inventory_dollar_impact, optimal_order_quantity, CostParams
-from src.optimization.budget_alloc import budget_dollar_impact, BudgetParams
+from src.optimization.budget_alloc_improved import budget_dollar_impact, BudgetParams
 from src.optimization.markdown import markdown_dollar_impact, MarkdownParams
 
 logging.basicConfig(
@@ -70,7 +70,7 @@ def make_forecast_df(cache_dir: Path, models: dict, id_col="id") -> pd.DataFrame
         preds   = preds.reset_index(drop=True)
 
         out_parts.append(pd.concat([
-            test_df[["id", "store_id", "item_id", "date", "sales"]],
+            test_df[["id", "store_id", "item_id", "date", "sales", "sell_price"]],
             preds
         ], axis=1))
 
@@ -154,9 +154,16 @@ def main():
     # Module 2 — Budget Allocation
     ba_params = BudgetParams(budget_usd=500_000)
     ba_impact = budget_dollar_impact(forecast_df, params=ba_params)
-    logger.info("  [BudgetAlloc] Revenue uplift 28d: $%s | Enterprise (ann.): $%s",
+    logger.info("  [BudgetAlloc] Revenue uplift 28d: $%s | Enterprise (ann.): $%s | Shadow price: $%.4f/$ | Items: %s",
                 f"{ba_impact['revenue_uplift_28d_usd']:,.0f}",
-                f"{ba_impact['enterprise_uplift_usd']:,.0f}")
+                f"{ba_impact['enterprise_uplift_usd']:,.0f}",
+                ba_impact["shadow_price_per_dollar"] or 0,
+                f"{ba_impact['n_items']:,}")
+    if ba_impact["actual_revenue_28d_usd"] is not None:
+        logger.info("  [BudgetAlloc] Actual revenue 28d: $%s | Uplift vs actual: $%s (%.1f%%)",
+                    f"{ba_impact['actual_revenue_28d_usd']:,.0f}",
+                    f"{ba_impact['revenue_uplift_vs_actual_28d_usd']:,.0f}",
+                    ba_impact["revenue_uplift_vs_actual_pct"])
 
     # Module 3 — Markdown
     md_impact = markdown_dollar_impact(forecast_df)
@@ -165,8 +172,9 @@ def main():
                 f"{md_impact['enterprise_gain_usd']:,.0f}")
 
     # ── Summary Report ────────────────────────────────────────────────────────
-    store_alloc_df = ba_impact.pop("store_allocation_df")
-    item_detail_df = md_impact.pop("item_detail_df")
+    store_rollup_df = ba_impact.pop("store_rollup_df")
+    item_detail_df  = ba_impact.pop("item_detail_df")
+    md_item_df      = md_impact.pop("item_detail_df")
 
     summary = {
         "run_timestamp"     : datetime.now().isoformat(),
@@ -186,19 +194,24 @@ def main():
     with open(report_path, "w") as f:
         json.dump(summary, f, indent=2, default=str)
 
-    store_alloc_df.to_csv(output_dir / "store_allocations.csv", index=False)
-    item_detail_df.to_csv(output_dir / "markdown_items.csv",    index=False)
+    store_rollup_df.to_csv(output_dir / "store_allocations.csv",  index=False)
+    item_detail_df.to_csv( output_dir / "item_allocations.csv",   index=False)
+    md_item_df.to_csv(     output_dir / "markdown_items.csv",     index=False)
 
     # Log summary to MLflow
     with mlflow.start_run(run_name="optimization_summary"):
         mlflow.log_metrics({
-            "nv_saving_28d"           : nv_impact["saving_28d_usd"],
-            "nv_enterprise_annual"    : nv_impact["enterprise_saving_usd"],
-            "ba_uplift_28d"           : ba_impact["revenue_uplift_28d_usd"],
-            "ba_enterprise_annual"    : ba_impact["enterprise_uplift_usd"],
-            "md_gain_28d"             : md_impact["revenue_gain_28d_usd"],
-            "md_enterprise_annual"    : md_impact["enterprise_gain_usd"],
-            "combined_enterprise_ann" : summary["combined_enterprise_annual_usd"],
+            "nv_saving_28d"                  : nv_impact["saving_28d_usd"],
+            "nv_enterprise_annual"           : nv_impact["enterprise_saving_usd"],
+            "ba_uplift_28d"                  : ba_impact["revenue_uplift_28d_usd"],
+            "ba_enterprise_annual"           : ba_impact["enterprise_uplift_usd"],
+            "ba_shadow_price"                : ba_impact["shadow_price_per_dollar"] or 0,
+            "ba_actual_revenue_28d"          : ba_impact["actual_revenue_28d_usd"] or 0,
+            "ba_uplift_vs_actual_28d"        : ba_impact["revenue_uplift_vs_actual_28d_usd"] or 0,
+            "ba_enterprise_uplift_vs_actual" : ba_impact["enterprise_uplift_vs_actual_usd"] or 0,
+            "md_gain_28d"                    : md_impact["revenue_gain_28d_usd"],
+            "md_enterprise_annual"           : md_impact["enterprise_gain_usd"],
+            "combined_enterprise_ann"        : summary["combined_enterprise_annual_usd"],
         })
 
     logger.info("=" * 60)

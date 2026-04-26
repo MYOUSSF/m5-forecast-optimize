@@ -129,19 +129,28 @@ def expected_revenue_item(order_qty:  np.ndarray,
 # ── Naive baseline: allocate proportional to expected revenue ─────────────────
 
 def _naive_allocation(q50:        np.ndarray,
+                       q90:        np.ndarray,
                        sell_price: np.ndarray,
                        unit_cost:  np.ndarray,
                        budget:     float) -> np.ndarray:
     """
-    Baseline: allocate budget proportional to q50 × sell_price (expected revenue
-    at median demand). Uses item-specific prices throughout.
+    Baseline: order q50 units per item (the median forecast), capped at q90,
+    scaled down proportionally if the total cost exceeds the budget.
+
+    This is the natural naive policy — order the median demand for each item —
+    and is a fair comparison point for the LP optimal.
     """
-    weights = q50 * sell_price
-    total   = weights.sum()
-    if total < 1e-9:
-        return np.zeros_like(q50)
-    budget_per_item = (weights / total) * budget
-    return budget_per_item / np.maximum(unit_cost, 1e-9)
+    # Ideal naive order: q50 per item, never exceed q90
+    ideal = np.minimum(q50, q90)
+    total_cost = (ideal * unit_cost).sum()
+
+    if total_cost <= budget:
+        # Budget is sufficient to order q50 for every item — use it as-is
+        return ideal
+    else:
+        # Scale all orders down proportionally to fit the budget
+        scale = budget / (total_cost + 1e-9)
+        return ideal * scale
 
 
 # ── LP budget allocation ──────────────────────────────────────────────────────
@@ -240,8 +249,10 @@ def lp_budget_allocation(forecast_df: pd.DataFrame,
     A_ub = csr_matrix((data, (row_idx, col_idx)), shape=(4 * n + 1, 2 * n))
     b_ub = np.array(b_ub)
 
-    # ── Bounds: Q_i ≥ 0, e_i ≥ 0 ─────────────────────────────────────────────
-    bounds = [(0, None)] * (2 * n)
+    # ── Bounds: 0 ≤ Q_i ≤ q90_i, e_i ≥ 0 ───────────────────────────────────
+    # Capping Q at q90 keeps both the LP and the naive baseline on the same
+    # footing — neither method should order beyond the 90th percentile.
+    bounds = [(0, float(q90[i])) for i in range(n)] + [(0, None)] * n
 
     # ── Solve ─────────────────────────────────────────────────────────────────
     result = linprog(
@@ -258,12 +269,11 @@ def lp_budget_allocation(forecast_df: pd.DataFrame,
 
     alloc = result.x[:n]
 
-    # Shadow price on budget constraint (dual variable, last row of y)
-    # linprog returns ineq_marginals for HiGHS
+    # Shadow price on budget constraint (dual variable on last inequality)
     shadow_price = float(result.ineqlin.marginals[-1]) if hasattr(result, "ineqlin") else None
 
     # ── Naive baseline ────────────────────────────────────────────────────────
-    naive_alloc = _naive_allocation(q50, sell_price, unit_cost, params.budget_usd)
+    naive_alloc = _naive_allocation(q50, q90, sell_price, unit_cost, params.budget_usd)
 
     # ── Build results ─────────────────────────────────────────────────────────
     rev_naive   = expected_revenue_item(naive_alloc, q10, q50, q90, sell_price)
@@ -295,6 +305,7 @@ def rollup_by_store(item_result: pd.DataFrame) -> pd.DataFrame:
                 alloc_optimal_units = ("alloc_optimal_units", "sum"),
                 revenue_naive_usd   = ("revenue_naive_usd",   "sum"),
                 revenue_optimal_usd = ("revenue_optimal_usd", "sum"),
+                actual_revenue_usd  = ("actual_revenue_usd",  "sum"),
                 cost_naive_usd      = ("cost_naive_usd",      "sum"),
                 cost_optimal_usd    = ("cost_optimal_usd",    "sum"),
                 n_items             = ("item_id",             "count"),
@@ -309,26 +320,58 @@ def budget_dollar_impact(forecast_df: pd.DataFrame,
     """
     Full pipeline: LP allocation → dollar impact summary.
     forecast_df must contain: id, item_id, store_id, q10, q50, q90, sell_price.
+    Optionally contains: sales (actual units sold) for ground-truth comparison.
 
     Returns summary dict suitable for MLflow logging / dashboard display,
     plus item_detail_df and store_rollup_df for deeper inspection.
 
-    Key extra output vs v1
-    ----------------------
+    Baselines reported
+    ------------------
+    actual_revenue   : sales × sell_price from the validation window — what
+                       Walmart actually earned under real stocking decisions.
+                       Only available when forecast_df contains a 'sales' column.
+    naive_revenue    : expected revenue under proportional q50 allocation —
+                       a modelled policy baseline.
+    optimal_revenue  : expected revenue under LP allocation.
+
     shadow_price_per_dollar : marginal revenue of an extra $1 of budget.
-                              E.g. 0.85 means an extra $1,000 budget yields ~$850
-                              in additional expected revenue.
     """
     if params is None:
         params = BudgetParams()
 
+    # ── Actual revenue from observed sales ────────────────────────────────────
+    has_actuals = "sales" in forecast_df.columns
+    if has_actuals:
+        actual_revenue = float(
+            (forecast_df["sales"] * forecast_df["sell_price"]).sum()
+        )
+    else:
+        actual_revenue = None
+
     item_result  = lp_budget_allocation(forecast_df, params)
+
+    # Attach actual revenue per item for store rollup
+    if has_actuals:
+        item_result["actual_revenue_usd"] = (
+            forecast_df["sales"].values * forecast_df["sell_price"].values
+        )
+    else:
+        item_result["actual_revenue_usd"] = np.nan
+
     store_result = rollup_by_store(item_result)
 
     total_rev_naive   = item_result["revenue_naive_usd"].sum()
     total_rev_optimal = item_result["revenue_optimal_usd"].sum()
     rev_uplift        = total_rev_optimal - total_rev_naive
     uplift_pct        = rev_uplift / (total_rev_naive + 1e-8) * 100
+
+    # Uplift vs actual observed revenue
+    if has_actuals:
+        uplift_vs_actual     = total_rev_optimal - actual_revenue
+        uplift_vs_actual_pct = uplift_vs_actual / (actual_revenue + 1e-8) * 100
+    else:
+        uplift_vs_actual     = None
+        uplift_vs_actual_pct = None
 
     top_gainer = (item_result
                   .groupby("store_id")["realloc_delta_units"]
@@ -340,23 +383,35 @@ def budget_dollar_impact(forecast_df: pd.DataFrame,
     n_items_reallocated = (item_result["realloc_delta_units"].abs() > 0.5).sum()
     shadow_price = item_result["shadow_price_per_dollar"].iloc[0]
 
-    annualised_uplift = rev_uplift * (365 / 28)
-    enterprise_uplift = annualised_uplift * 470
+    annualised_uplift           = rev_uplift * (365 / 28)
+    enterprise_uplift           = annualised_uplift * 470
+    annualised_uplift_vs_actual = (uplift_vs_actual * (365 / 28)
+                                   if uplift_vs_actual is not None else None)
+    enterprise_uplift_vs_actual = (annualised_uplift_vs_actual * 470
+                                   if annualised_uplift_vs_actual is not None else None)
 
     return {
-        "policy"                        : "LP — Item-Store Level (HiGHS)",
-        "budget_usd"                    : params.budget_usd,
-        "n_items"                       : len(item_result),
-        "n_items_reallocated"           : int(n_items_reallocated),
-        "total_revenue_naive_usd"       : round(total_rev_naive,   2),
-        "total_revenue_optimal_usd"     : round(total_rev_optimal, 2),
-        "revenue_uplift_28d_usd"        : round(rev_uplift,        2),
-        "revenue_uplift_pct"            : round(uplift_pct,        2),
-        "annualised_uplift_10stores_usd": round(annualised_uplift,  0),
-        "enterprise_uplift_usd"         : round(enterprise_uplift,  0),
-        "shadow_price_per_dollar"       : round(shadow_price, 4) if shadow_price else None,
-        "top_gaining_store"             : top_gainer,
-        "top_losing_store"              : top_loser,
-        "item_detail_df"                : item_result,
-        "store_rollup_df"               : store_result,
+        "policy"                             : "LP — Item-Store Level (HiGHS)",
+        "budget_usd"                         : params.budget_usd,
+        "n_items"                            : len(item_result),
+        "n_items_reallocated"                : int(n_items_reallocated),
+        # ── vs naive baseline ──────────────────────────────────────────────
+        "total_revenue_naive_usd"            : round(total_rev_naive,    2),
+        "total_revenue_optimal_usd"          : round(total_rev_optimal,  2),
+        "revenue_uplift_28d_usd"             : round(rev_uplift,         2),
+        "revenue_uplift_pct"                 : round(uplift_pct,         2),
+        "annualised_uplift_10stores_usd"     : round(annualised_uplift,   0),
+        "enterprise_uplift_usd"              : round(enterprise_uplift,   0),
+        # ── vs actual observed revenue ─────────────────────────────────────
+        "actual_revenue_28d_usd"             : round(actual_revenue, 2) if actual_revenue is not None else None,
+        "revenue_uplift_vs_actual_28d_usd"   : round(uplift_vs_actual, 2) if uplift_vs_actual is not None else None,
+        "revenue_uplift_vs_actual_pct"       : round(uplift_vs_actual_pct, 2) if uplift_vs_actual_pct is not None else None,
+        "annualised_uplift_vs_actual_usd"    : round(annualised_uplift_vs_actual, 0) if annualised_uplift_vs_actual is not None else None,
+        "enterprise_uplift_vs_actual_usd"    : round(enterprise_uplift_vs_actual, 0) if enterprise_uplift_vs_actual is not None else None,
+        # ── other ──────────────────────────────────────────────────────────
+        "shadow_price_per_dollar"            : round(shadow_price, 4) if shadow_price else None,
+        "top_gaining_store"                  : top_gainer,
+        "top_losing_store"                   : top_loser,
+        "item_detail_df"                     : item_result,
+        "store_rollup_df"                    : store_result,
     }

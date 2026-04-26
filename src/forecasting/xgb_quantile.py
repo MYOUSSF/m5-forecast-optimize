@@ -3,12 +3,6 @@ XGBoost Quantile Forecasting — GPU-Accelerated
 ===============================================
 Trains q10/q50/q90 models from per-store parquet files directly,
 never loading the full 57M-row dataset into RAM at once.
-
-GPU usage
----------
-XGBoost with tree_method="hist" + device="cuda" runs natively on
-Kaggle's P100 GPU — no special compilation needed. Expect 3-5x
-speedup over CPU on 57M rows.
 """
 
 import gc
