@@ -100,6 +100,11 @@ PLOTLY_TEMPLATE = "plotly_dark"
 
 
 def fmt_dollar(v):
+    # Ensure numeric type
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "$0"
     if abs(v) >= 1e9: return f"${v/1e9:.1f}B"
     if abs(v) >= 1e6: return f"${v/1e6:.1f}M"
     if abs(v) >= 1e3: return f"${v/1e3:.0f}K"
